@@ -996,3 +996,45 @@ def test_the_render_map_sends_each_joint_to_its_own_viser_slot(app):
         assert "jaw" in names[viser_index]
     mapped = {i for i in app._viser_map if i >= 0}
     assert len(mapped) == len(solver_names), "not every arm joint is rendered"
+
+
+def test_park_on_exit_is_configurable():
+    """Jogging inside a fixture must not commit you to a MoveJ home on Ctrl-C."""
+    assert JogCmdConfig().park_on_exit is True
+    assert JogCmdConfig(park_on_exit=False).park_on_exit is False
+
+
+def test_shutdown_uncancels_before_awaiting_cleanup():
+    """SIGINT cancels the task; cleanup awaits must survive it.
+
+    Without ``uncancel`` every await in the shutdown path re-raises
+    CancelledError at once, so the return to rest is skipped in silence — the
+    operator is told the arms are going home and they do not.
+    """
+    import inspect
+
+    from almond_axol.cli import jog as jog_module
+
+    source = inspect.getsource(jog_module._session)
+    assert "uncancel" in source
+    assert source.index("uncancel") < source.index("await app.park()")
+
+
+async def test_park_plans_a_speed_profiled_move_not_a_jump(app, kin):
+    """Park must not begin by teleporting the setpoint."""
+    from almond_axol.robot.config import AxolConfig
+
+    app.ui["step_mm"].value = 80.0
+    for _ in range(3):
+        app._on_jog_translate(1)(event("-"))
+    pump(app)
+
+    q_now, _ = await app.commander.current_state()
+    trajectory = app.commander.plan_joint(
+        q_now, kin.rest_q(), speed=0.6, min_duration=1.5
+    )
+    steps = [
+        float(np.max(np.abs(trajectory[i + 1] - trajectory[i])))
+        for i in range(len(trajectory) - 1)
+    ]
+    assert max(steps) <= AxolConfig().max_step_rad, max(steps)

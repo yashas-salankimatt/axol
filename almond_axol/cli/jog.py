@@ -139,6 +139,13 @@ class JogCmdConfig:
     """CAN channel for the right arm."""
     rate_hz: float = 250.0
     """Control rate for planning and playback."""
+    park_on_exit: bool = True
+    """Drive back to the rest pose when the session ends (hardware only).
+
+    Leaves the robot somewhere known. Turn it off when jogging inside a fixture
+    or a machine enclosure: the return is planned clear of the robot's *own*
+    body, and nothing in this SDK models the world around it, so a MoveJ home
+    from deep inside a workspace is not something to trigger on a keystroke."""
     telemetry_hz: float = 500.0
     log_level: LogLevel = "INFO"
 
@@ -1194,7 +1201,7 @@ class JogApp:
 
                 # Render whatever the robot reports, so the view is the robot's
                 # state and not the app's intention — the same on hardware.
-                left, right = await self.robot.get_positions()
+                left, right = await self.commander.read_positions()
                 if left is not None and right is not None:
                     left = np.asarray(left, dtype=np.float32)
                     right = np.asarray(right, dtype=np.float32)
@@ -1277,7 +1284,30 @@ async def _session(cfg: JogCmdConfig) -> None:
         print(f"\n  Cartesian jog UI:  http://localhost:{cfg.port}\n", flush=True)
         try:
             await app.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\n  Interrupted.", flush=True)
         finally:
-            if not cfg.sim:
-                await app.park()
+            # asyncio.run cancels this task on SIGINT (Python 3.11+), so every
+            # await below would re-raise CancelledError immediately and the
+            # shutdown would be skipped silently — including the return to
+            # rest. Same trap ``axol waypoints`` documents.
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+            app.quit.set()
+            if not cfg.sim and cfg.park_on_exit:
+                print(
+                    "\n  Returning to the rest pose — the arms will MOVE.\n"
+                    "  Ctrl-C again to abort and leave them where they are.\n",
+                    flush=True,
+                )
+                try:
+                    await app.park()
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    print("  Park aborted — arms left in place.", flush=True)
+            elif not cfg.sim:
+                print(
+                    "\n  Leaving the arms where they are (--park_on_exit False).\n",
+                    flush=True,
+                )
             app.server.stop()

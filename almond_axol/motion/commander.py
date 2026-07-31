@@ -223,13 +223,36 @@ class MotionCommander:
 
     # -- state -----------------------------------------------------------
 
+    async def read_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm ``(8,)`` state, via the telemetry cache when there is one.
+
+        On hardware ``get_positions()`` issues a fresh CAN read per motor, and
+        the driver **rejects it outright** while background telemetry is
+        running (``MotorError: Telemetry is active``). The cached
+        ``AxolArm.positions`` is the real-time read, and the only valid one
+        once ``start_telemetry`` has been called — it is also non-blocking,
+        which matters when the caller is a 30 Hz UI loop that would otherwise
+        put a burst of CAN traffic on the bus every frame.
+
+        A robot with no telemetry cache (the simulator) falls through to
+        ``get_positions``.
+        """
+        left_arm = getattr(self.robot, "left", None)
+        right_arm = getattr(self.robot, "right", None)
+        if left_arm is not None or right_arm is not None:
+            return (
+                left_arm.positions if left_arm is not None else None,
+                right_arm.positions if right_arm is not None else None,
+            )
+        return await self.robot.get_positions()
+
     async def current_state(self) -> tuple[np.ndarray, Grips]:
         """Read the robot's joint vector and gripper openings.
 
         Falls back to the rest pose for an arm the robot reports as absent, so
         a single-arm machine still plans.
         """
-        left, right = await self.robot.get_positions()
+        left, right = await self.read_positions()
         q = self.kinematics.rest_q()
         grips = [1.0, 1.0]
         for i, (arm, values) in enumerate(((Arm.LEFT, left), (Arm.RIGHT, right))):

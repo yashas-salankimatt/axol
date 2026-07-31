@@ -375,3 +375,43 @@ def test_ease_in_offsets_empty_when_already_aligned():
     q = np.zeros(3, dtype=np.float32)
     assert ease_in_offsets(q, q, 0.4, 50.0).size == 0
     assert ease_in_offsets(None, q, 0.4, 50.0).size == 0
+
+
+async def test_read_positions_prefers_the_telemetry_cache(kin):
+    """On hardware a direct CAN read is *rejected* while telemetry runs.
+
+    ``Axol.get_positions()`` polls each motor and the driver raises
+    ``MotorError: Telemetry is active`` once ``start_telemetry`` has been
+    called. The cached ``AxolArm.positions`` is the only valid real-time read —
+    and the only one cheap enough for a 30 Hz loop.
+    """
+
+    class FakeArm:
+        def __init__(self, values):
+            self.positions = values
+
+    class FakeAxol(VirtualRobot):
+        def __init__(self, left, right):
+            super().__init__()
+            self.left = FakeArm(left)
+            self.right = FakeArm(right)
+
+        async def get_positions(self):
+            raise AssertionError("polled the bus while telemetry was running")
+
+    left = np.arange(8, dtype=np.float32)
+    right = np.arange(8, dtype=np.float32) * 2
+    commander = MotionCommander(kin, FakeAxol(left, right), rate_hz=TEST_RATE)
+
+    got_left, got_right = await commander.read_positions()
+    assert np.allclose(got_left, left)
+    assert np.allclose(got_right, right)
+    # And the whole state read must go through it too.
+    q, _ = await commander.current_state()
+    assert np.allclose(kin.arm_q(q, Arm.LEFT), left[:7])
+
+
+async def test_read_positions_falls_back_without_a_cache(commander, q_ready):
+    """The simulator has no telemetry cache; it must still work."""
+    left, right = await commander.read_positions()
+    assert left is not None and right is not None
