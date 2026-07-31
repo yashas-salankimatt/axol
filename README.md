@@ -130,6 +130,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
+- [`jog`](https://docs.almond.bot/cli/jog) — Cartesian teach pendant: drag or jog to a pose, build and play a waypoint program
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)

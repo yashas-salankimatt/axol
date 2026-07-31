@@ -26,6 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
 gamepad = ["pygame>=2.6"]
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
@@ -38,3 +39,8 @@ axol = "almond_axol.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

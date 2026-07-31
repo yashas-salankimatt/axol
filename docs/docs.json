@@ -83,7 +83,8 @@
               "cli/tune-friction",
               "cli/tune-repeatability",
               "cli/gravity-comp",
-              "cli/waypoints"
+              "cli/waypoints",
+              "cli/jog"
             ]
           },
           {

@@ -1,0 +1,81 @@
+---
+title: "axol jog"
+description: "Cartesian teach pendant — drag or jog to a pose, build a waypoint program, play it back."
+---
+
+Drag either gripper to a pose and the arm follows by inverse kinematics; step-jog it along world or tool axes; record where it is as a waypoint; reorder and edit the resulting program; play it back. The program file it writes runs unchanged on the robot.
+
+```bash
+axol jog                          # simulator, default program file
+axol jog --file bolt_test.json    # a named program
+axol jog --sim False              # drive the real robot
+```
+
+Open the printed URL (default [http://localhost:8010](http://localhost:8010)).
+
+<Note>
+  Unlike [`axol waypoints`](/cli/waypoints), which can only record poses you have already hand-guided the arm into, every pose here comes from a drag, a typed coordinate, or a jog step. No hardware and no teaching are required, so a program can be built and rehearsed on a laptop and carried to the robot.
+</Note>
+
+## The world frame
+
+Poses are absolute, in the URDF root frame, measured from the bundled model:
+
+| Axis | Direction |
+|---|---|
+| `+X` | toward the **left** arm |
+| `+Y` | **behind** the robot (so `-Y` is forward) |
+| `+Z` | **up** |
+
+Shoulders sit at `(±0.13, 0, 0.86)`. Older docstrings in the SDK describe this frame as "FLU" (Forward-Left-Up); that is wrong — under FLU the arms would be separated along `Y`, and they are measurably separated along `X`. It never caused a bug because VR teleop works entirely in *relative* deltas, so the absolute convention cancelled out.
+
+Which physical side is "front" is a mounting convention that cannot be read off a URDF. `-Y` is the direction the arms flex toward; confirm against the robot before trusting it near a fixture.
+
+## Controls
+
+**Target** — which arm the pose fields and jog buttons act on, whether jogging is expressed in the **World** or **Tool** frame, and whether both arms move together.
+
+**Pose** — live tool position (m) and orientation (degrees, intrinsic X-Y-Z, the same convention URDF `rpy` uses). Editable: type a coordinate and the arm goes there.
+
+**Jog** — step size, then `−`/`+` per axis for translation and rotation. Tool-frame jogging follows the tool's own axes, so `+Z` runs along the approach direction wherever the wrist is pointing.
+
+**Waypoints** — add, update to the current pose, go to, reorder, duplicate, delete, rename, and set the move type. The list and the 3D axis markers both update on every edit, and the file is saved immediately.
+
+**Program** — speed, dwell, loop count, play, stop, save, reload.
+
+## Move types
+
+Each waypoint records how to travel *to* it, matching the primitives every industrial controller exposes:
+
+| Type | Behaviour | Use for |
+|---|---|---|
+| `MoveJ` | Joint-space interpolation, projected clear of the torso. The tool sweeps an arc. | Free-air repositioning. Always feasible if both ends are. |
+| `MoveL` | The tool held to a straight world-frame line while its orientation slerps. | Approaches, insertions, withdrawals — anywhere the *path* matters. |
+
+The approach leg is always a `MoveJ`: playback starts from wherever the arm happens to be, and forcing a straight line from an arbitrary pose is how an elbow ends up in the torso.
+
+Every leg is planned **before anything moves**, so an unreachable pose is reported while the robot is standing still.
+
+## Program file
+
+JSON, version 2. Each waypoint stores a Cartesian pose per arm *and* the joint configuration that reaches it. Both are kept on purpose: the pose is what you edit and what survives being expressed relative to a fixture frame, while the joints record which of the infinitely many ways to reach that pose the arm actually used. Axol has 7 joints for a 6-DOF task, so a pose does not determine a configuration — replaying from the stored joints is what makes a program repeatable instead of letting the solver pick a different elbow branch on each run.
+
+Version 1 files written by [`axol waypoints`](/cli/waypoints) are read too; their poses are recovered by forward kinematics.
+
+## Simulator honesty
+
+`--sim` renders and replays exactly what it is commanded. It has no dynamics, no compliance, and no contact, so it will show a flawless insertion regardless of what the real arm would do.
+
+It answers reachability, path shape, self-collision, and program logic. It **cannot** answer repeatability or absolute accuracy — only hardware can.
+
+## Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--file` | `~/.almond/program.json` | Program to edit and play back |
+| `--sim` | `True` | Use the built-in visualiser instead of the robot |
+| `--port` | `8010` | Browser UI port |
+| `--rate_hz` | `250` | Control rate for planning and playback |
+| `--left_channel` / `--right_channel` | standard CAN channels | Per-arm CAN interface |
+| `--kinematics.*` | see [configuration](/cli/configuration) | IK cost weights |
+| `--axol.*` | see [configuration](/cli/configuration) | Stiffness, gripper, SKU |
