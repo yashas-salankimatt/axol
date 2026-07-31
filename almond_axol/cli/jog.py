@@ -87,6 +87,10 @@ DRAG_IDLE_TICKS = 45
 """App-loop ticks (1.5 s at 30 Hz) a drag may go without a gizmo update before
 its flag is treated as stranded. See :meth:`JogApp._expire_stale_drags`."""
 
+_SIDE: dict[Arm, str] = {Arm.LEFT: "L", Arm.RIGHT: "R"}
+"""Short side labels. The tracking panel is narrow enough that spelling out
+"left"/"right" wraps every row onto two lines."""
+
 TRACKING_FAULT_RAD = 0.26
 """Tracking error (rad, ~15°) at which jogging halts and the setpoint re-adopts.
 
@@ -476,16 +480,12 @@ class JogApp:
                 )
 
         with gui.add_folder("Tracking (commanded vs actual)"):
-            self.ui["track_worst"] = gui.add_text(
-                "Worst joint", initial_value="—", disabled=True
-            )
-            self.ui["track_left"] = gui.add_text(
-                "Left tool", initial_value="—", disabled=True
-            )
-            self.ui["track_right"] = gui.add_text(
-                "Right tool", initial_value="—", disabled=True
-            )
-            self.ui["track_table"] = gui.add_markdown("_waiting for telemetry_")
+            # Markdown, not add_text: a disabled text box renders as a narrow
+            # labelled input that truncates mid-value — which is how the whole
+            # Cartesian readout ended up invisible behind "(dx -149...".
+            self.ui["track_worst"] = gui.add_markdown("_waiting for telemetry_")
+            self.ui["track_cartesian"] = gui.add_markdown("")
+            self.ui["track_table"] = gui.add_markdown("")
 
         with gui.add_folder("Jog"):
             self.ui["step_mm"] = gui.add_slider(
@@ -790,16 +790,17 @@ class JogApp:
         self._set_status("Returned to the ready pose.")
 
     def _joint_label(self, index: int) -> str:
-        """Operator-facing name for a joint index, e.g. ``left shoulder_2``.
+        """Operator-facing name for a joint index, e.g. ``L shoulder_2``.
 
         The solver names joints as the URDF does (``left_s2_0``), which is not
         what is written on the robot or in the gain tables an operator will be
-        editing.
+        editing. Abbreviated to ``L``/``R`` because the panel is narrow and
+        "left shoulder_1" wraps onto two lines in every row.
         """
         for arm in ARMS:
             positions = self.kin.indices(arm)
             if index in positions:
-                return f"{arm.value} {ARM_JOINTS[positions.index(index)].value}"
+                return f"{_SIDE[arm]} {ARM_JOINTS[positions.index(index)].value}"
         return str(index)
 
     def _check_tracking_fault(self, q_actual: np.ndarray) -> bool:
@@ -854,27 +855,41 @@ class JogApp:
         error = np.asarray(q_actual, dtype=np.float32) - commanded
 
         worst = int(np.argmax(np.abs(error)))
-        self.ui[
-            "track_worst"
-        ].value = f"{self._joint_label(worst)}  {np.degrees(error[worst]):+.2f}°"
+        self.ui["track_worst"].content = (
+            f"**worst joint** &nbsp; `{self._joint_label(worst)}` &nbsp; "
+            f"**{np.degrees(error[worst]):+.2f}°**"
+        )
 
-        rows = ["| joint | cmd | actual | error |", "|---|---|---|---|"]
+        # Cartesian deviation: forward kinematics of the commanded joint vector
+        # against forward kinematics of the measured one, at the tool. This is
+        # what the joint error actually costs at the fingertips, which is not
+        # something the per-joint numbers show — a degree at the shoulder and a
+        # degree at the wrist are very different distances out there.
+        cartesian = [
+            "| arm | dx | dy | dz | dist | angle |",
+            "|:--|--:|--:|--:|--:|--:|",
+        ]
+        joints = ["| joint | cmd | act | err |", "|:--|--:|--:|--:|"]
         for arm in ARMS:
             want = self.kin.fk_arm(commanded, arm, self.tool)
             have = self.kin.fk_arm(q_actual, arm, self.tool)
-            delta = have.position - want.position
-            self.ui[f"track_{arm.value}"].value = (
-                f"{have.distance_to(want) * 1e3:6.2f} mm   "
-                f"{np.degrees(have.angle_to(want)):5.2f}°   "
-                f"(dx {delta[0] * 1e3:+.1f}, dy {delta[1] * 1e3:+.1f}, dz {delta[2] * 1e3:+.1f} mm)"
+            delta = (have.position - want.position) * 1e3
+            cartesian.append(
+                f"| **{_SIDE[arm]}** | {delta[0]:+.2f} | {delta[1]:+.2f} | {delta[2]:+.2f} "
+                f"| **{have.distance_to(want) * 1e3:.2f}** | **{np.degrees(have.angle_to(want)):.2f}** |"
             )
             for index in self.kin.indices(arm):
-                rows.append(
-                    f"| {self._joint_label(index)} | {np.degrees(commanded[index]):+.2f}° "
-                    f"| {np.degrees(q_actual[index]):+.2f}° "
-                    f"| **{np.degrees(error[index]):+.2f}°** |"
+                joints.append(
+                    f"| {self._joint_label(index)} | {np.degrees(commanded[index]):+.2f} "
+                    f"| {np.degrees(q_actual[index]):+.2f} "
+                    f"| **{np.degrees(error[index]):+.2f}** |"
                 )
-        self.ui["track_table"].content = "\n".join(rows)
+        self.ui["track_cartesian"].content = (
+            "**tool deviation** (mm, deg)\n\n" + "\n".join(cartesian)
+        )
+        self.ui["track_table"].content = "**joint deviation** (deg)\n\n" + "\n".join(
+            joints
+        )
 
     # -- IK loop ---------------------------------------------------------
 

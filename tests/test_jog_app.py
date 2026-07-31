@@ -1111,6 +1111,15 @@ async def test_the_control_loop_still_rate_limits(app):
     assert steps > 10
 
 
+def cartesian_row(app, side: str) -> list[float]:
+    """Parse one arm's row out of the tool-deviation table."""
+    for line in app.ui["track_cartesian"].content.splitlines():
+        cells = [c.strip().strip("*") for c in line.split("|") if c.strip()]
+        if cells and cells[0] == side:
+            return [float(c) for c in cells[1:]]
+    raise AssertionError(f"no row for {side} in:\n{app.ui['track_cartesian'].content}")
+
+
 def test_tracking_reports_commanded_versus_actual(app):
     """The readout must show a real deviation, not the commanded pose twice."""
     app._track_last = 0.0
@@ -1119,19 +1128,58 @@ def test_tracking_reports_commanded_versus_actual(app):
 
     app._report_tracking(q_actual)
 
-    assert "3.0" in app.ui["track_worst"].value or "2.9" in app.ui["track_worst"].value
-    assert "mm" in app.ui["track_left"].value
-    assert float(app.ui["track_left"].value.split("mm")[0].strip()) > 0.0
-    # The untouched arm should read essentially zero.
-    assert float(app.ui["track_right"].value.split("mm")[0].strip()) < 0.01
+    assert "shoulder_2" in app.ui["track_worst"].content
+    assert (
+        "3.0" in app.ui["track_worst"].content or "2.9" in app.ui["track_worst"].content
+    )
     assert "shoulder" in app.ui["track_table"].content
+
+
+def test_cartesian_deviation_is_the_fk_difference(app):
+    """The tool numbers must be FK(commanded) vs FK(actual), not a guess.
+
+    A degree at the shoulder and a degree at the wrist are wildly different
+    distances at the fingertips, which is the whole reason this row exists
+    alongside the joint table.
+    """
+    app._track_last = 0.0
+    q_actual = app._commanded.copy()
+    q_actual[app.kin.indices(Arm.LEFT)[1]] += np.radians(3.0)
+    app._report_tracking(q_actual)
+
+    want = app.kin.fk_arm(app._commanded, Arm.LEFT, app.tool)
+    have = app.kin.fk_arm(q_actual, Arm.LEFT, app.tool)
+    expected = (have.position - want.position) * 1e3
+
+    dx, dy, dz, dist, angle = cartesian_row(app, "L")
+    assert dx == pytest.approx(expected[0], abs=0.02)
+    assert dy == pytest.approx(expected[1], abs=0.02)
+    assert dz == pytest.approx(expected[2], abs=0.02)
+    assert dist == pytest.approx(have.distance_to(want) * 1e3, abs=0.02)
+    assert angle == pytest.approx(np.degrees(have.angle_to(want)), abs=0.02)
+    assert dist > 1.0, "a 3 deg shoulder error should be millimetres at the tool"
+
+    # The untouched arm reads zero on every axis.
+    assert cartesian_row(app, "R") == pytest.approx([0.0] * 5, abs=1e-3)
 
 
 def test_tracking_reads_zero_when_the_arm_is_on_target(app):
     app._track_last = 0.0
     app._report_tracking(app._commanded.copy())
-    assert float(app.ui["track_left"].value.split("mm")[0].strip()) < 1e-3
-    assert float(app.ui["track_right"].value.split("mm")[0].strip()) < 1e-3
+    assert cartesian_row(app, "L") == pytest.approx([0.0] * 5, abs=1e-3)
+    assert cartesian_row(app, "R") == pytest.approx([0.0] * 5, abs=1e-3)
+
+
+def test_the_panel_uses_short_side_labels(app):
+    """ "left shoulder_1" wraps onto two lines in a panel this narrow."""
+    app._track_last = 0.0
+    app._report_tracking(app._commanded.copy())
+    table = app.ui["track_table"].content
+    assert "L shoulder_1" in table and "R shoulder_1" in table
+    assert "left " not in table and "right " not in table
+    assert "**L**" in app.ui["track_cartesian"].content
+    assert "**R**" in app.ui["track_cartesian"].content
+    assert "left" not in app.ui["track_cartesian"].content
 
 
 # ---------------------------------------------------------------------------
