@@ -1132,3 +1132,81 @@ def test_tracking_reads_zero_when_the_arm_is_on_target(app):
     app._report_tracking(app._commanded.copy())
     assert float(app.ui["track_left"].value.split("mm")[0].strip()) < 1e-3
     assert float(app.ui["track_right"].value.split("mm")[0].strip()) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Tracking-fault failsafe
+# ---------------------------------------------------------------------------
+
+
+def test_a_dead_joint_halts_jogging_and_re_adopts(app):
+    """A joint that stops following is a dead motor, not a tracking error.
+
+    The danger is windup: the impedance command is ``kp * (target - actual)``,
+    so a joint sagging 36 deg away at kp=158 leaves ~100 Nm standing by. The
+    moment it re-enables it slams. The setpoint must follow the arm instead.
+    """
+    from almond_axol.cli.jog import TRACKING_FAULT_RAD
+
+    q_actual = app._commanded.copy()
+    collapsed = app.kin.indices(Arm.LEFT)[1]
+    q_actual[collapsed] += TRACKING_FAULT_RAD * 2.0
+
+    assert app._check_tracking_fault(q_actual) is True
+    assert app._tracking_fault
+    # Setpoint now equals where the arm actually is: zero demand on every joint.
+    assert np.allclose(app._commanded, q_actual, atol=1e-6)
+    assert np.allclose(app.q, q_actual, atol=1e-6)
+    assert "shoulder_2" in app._status
+
+
+def test_small_tracking_errors_are_not_treated_as_faults(app):
+    """Ordinary sag under soft gains must not halt the session."""
+    from almond_axol.cli.jog import TRACKING_FAULT_RAD
+
+    q_actual = app._commanded.copy()
+    q_actual[app.kin.indices(Arm.LEFT)[1]] += TRACKING_FAULT_RAD * 0.5
+    assert app._check_tracking_fault(q_actual) is False
+    assert not app._tracking_fault
+
+
+def test_jogging_is_refused_while_a_fault_is_latched(app):
+    from almond_axol.cli.jog import TRACKING_FAULT_RAD
+
+    q_actual = app._commanded.copy()
+    q_actual[app.kin.indices(Arm.LEFT)[1]] += TRACKING_FAULT_RAD * 2.0
+    app._check_tracking_fault(q_actual)
+
+    before = app.q.copy()
+    app.ui["step_mm"].value = 50.0
+    app._on_jog_translate(2)(event("+"))
+    for fn in app.pending.drain():
+        fn()
+    assert np.allclose(app.q, before), "jogged while a joint was down"
+    assert "Clear fault" in app._status
+
+
+def test_clearing_the_fault_re_reads_the_arm_before_resuming(app):
+    """Resuming must not command a jump from a pre-collapse setpoint."""
+    from almond_axol.cli.jog import TRACKING_FAULT_RAD
+
+    q_actual = app._commanded.copy()
+    q_actual[app.kin.indices(Arm.LEFT)[1]] += TRACKING_FAULT_RAD * 2.0
+    app._check_tracking_fault(q_actual)
+
+    app._clear_tracking_fault()
+    assert not app._tracking_fault
+    assert app._needs_readopt, "must re-read the robot before accepting jogs"
+
+
+def test_the_fault_check_is_inert_during_playback(app):
+    """Playback owns the arm and blends deliberately; it must not self-trip."""
+    from almond_axol.cli.jog import TRACKING_FAULT_RAD
+
+    app._playing = True
+    try:
+        q_actual = app._commanded.copy()
+        q_actual[app.kin.indices(Arm.LEFT)[1]] += TRACKING_FAULT_RAD * 3.0
+        assert app._check_tracking_fault(q_actual) is False
+    finally:
+        app._playing = False

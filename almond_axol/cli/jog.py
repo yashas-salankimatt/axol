@@ -87,6 +87,23 @@ DRAG_IDLE_TICKS = 45
 """App-loop ticks (1.5 s at 30 Hz) a drag may go without a gizmo update before
 its flag is treated as stranded. See :meth:`JogApp._expire_stale_drags`."""
 
+TRACKING_FAULT_RAD = 0.26
+"""Tracking error (rad, ~15°) at which jogging halts and the setpoint re-adopts.
+
+A joint that has stopped following its setpoint is not a tracking problem, it
+is a dead joint — a motor that hit a protection limit and disabled its output
+latches the fault and stops producing torque, and the SDK's telemetry callback
+throws the status byte away, so nothing else notices.
+
+What makes it dangerous is *windup*. The impedance command is
+``kp * (target - actual)``; with the left shoulder_2 gain at 158 and the arm
+sagging 36.5° away, that is a demand for roughly 100 Nm standing by. The
+instant the motor clears its fault or is re-enabled, it slams to the setpoint.
+
+So on a large error the setpoint is re-adopted to where the arm actually is.
+Every healthy joint keeps its holding torque and gravity compensation — the
+arm does not go limp — but nothing is left wound up against a dead one."""
+
 TRACKING_REPORT_HZ = 8.0
 """How often the commanded-vs-actual readout is refreshed. Fast enough to watch
 an oscillation build, slow enough not to flood the websocket."""
@@ -227,6 +244,8 @@ class JogApp:
         self._drag_seen: dict[Arm, int] = {}
         self._io_failures = 0
         self._track_last = 0.0
+        self._tracking_fault = False
+        self._needs_readopt = False
         self._playback_task: asyncio.Task | None = None
         self._fields_written: tuple[float, ...] = ()
         self._gizmo_offset: dict[Arm, Pose] = {arm: Pose.identity() for arm in ARMS}
@@ -481,6 +500,9 @@ class JogApp:
             for axis, label in enumerate(("Roll", "Pitch", "Yaw")):
                 group = gui.add_button_group(f"{label} rotate", ("−", "+"))
                 group.on_click(self._on_jog_rotate(axis))
+            gui.add_button("⚠ Clear fault and resume").on_click(
+                lambda _: self.pending.push(self._clear_tracking_fault)
+            )
             gui.add_button("Reset to ready pose").on_click(
                 lambda _: self.pending.push(self._when_idle(self._go_rest))
             )
@@ -571,6 +593,12 @@ class JogApp:
         def action() -> None:
             if self._playing:
                 self._set_status("Playing — press Stop before jogging or editing.")
+                return
+            if self._tracking_fault:
+                self._set_status(
+                    "A joint stopped following its setpoint — check the motor, "
+                    "then press 'Clear fault' to resume."
+                )
                 return
             fn()
 
@@ -733,6 +761,19 @@ class JogApp:
 
         return handler
 
+    def _clear_tracking_fault(self) -> None:
+        """Resume jogging after a halted joint has been dealt with.
+
+        Re-reads the arm first, so resuming cannot itself command a jump from a
+        setpoint recorded before the joint gave way.
+        """
+        if not self._tracking_fault:
+            self._set_status("No fault to clear.")
+            return
+        self._tracking_fault = False
+        self._set_status("Fault cleared — re-reading the arm before resuming.")
+        self._needs_readopt = True
+
     def _go_rest(self) -> None:
         # The *ready* pose, not the park pose: rest is 88% extended and jogging
         # out of it immediately meets the reach clamp.
@@ -760,6 +801,39 @@ class JogApp:
             if index in positions:
                 return f"{arm.value} {ARM_JOINTS[positions.index(index)].value}"
         return str(index)
+
+    def _check_tracking_fault(self, q_actual: np.ndarray) -> bool:
+        """Halt and re-adopt if a joint has stopped following its setpoint.
+
+        Returns True if a fault was just latched. See :data:`TRACKING_FAULT_RAD`
+        for why winding a setpoint up against a dead joint is the thing to
+        avoid.
+        """
+        error = np.asarray(q_actual, dtype=np.float32) - self._commanded
+        worst = int(np.argmax(np.abs(error)))
+        if abs(float(error[worst])) < TRACKING_FAULT_RAD or self._playing:
+            return False
+        if self._tracking_fault:
+            return False
+
+        self._tracking_fault = True
+        # Follow the arm rather than fight it: zero the error so no joint is
+        # left demanding torque it cannot deliver.
+        self.q = np.asarray(q_actual, dtype=np.float32).copy()
+        self._commanded = self.q.copy()
+        self.commander.adopt_commanded(self._commanded)
+        self.targets.update(self.kin.fk(self.q, self.tool))
+        self._sync_gizmos()
+        self._sync_pose_fields()
+        message = (
+            f"⚠ {self._joint_label(worst)} stopped following its setpoint "
+            f"({np.degrees(error[worst]):+.1f}°). Jogging halted and the setpoint "
+            "re-adopted so nothing is wound up against it. Check the motor: stop "
+            "this session and run `axol motor.health`."
+        )
+        self._set_status(message)
+        _logger.error("%s", message)
+        return True
 
     def _report_tracking(self, q_actual: np.ndarray) -> None:
         """Publish how far the arm is lagging what it was told to do.
@@ -1303,6 +1377,11 @@ class JogApp:
                     _logger.exception("UI action failed")
                     self._set_status(f"Error: {exc}")
 
+            if self._needs_readopt:
+                self._needs_readopt = False
+                with contextlib.suppress(Exception):
+                    await self._adopt_robot_state()
+
             self._expire_stale_drags()
 
             if self._target_dirty and not self._playing:
@@ -1332,6 +1411,7 @@ class JogApp:
                     q_actual[self.kin.indices(Arm.LEFT)] = left[:7]
                     q_actual[self.kin.indices(Arm.RIGHT)] = right[:7]
                     self._render(q_actual, (float(left[7]), float(right[7])))
+                    self._check_tracking_fault(q_actual)
                     self._report_tracking(q_actual)
             except asyncio.CancelledError:
                 raise
