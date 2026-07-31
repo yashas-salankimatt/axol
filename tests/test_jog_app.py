@@ -998,10 +998,15 @@ def test_the_render_map_sends_each_joint_to_its_own_viser_slot(app):
     assert len(mapped) == len(solver_names), "not every arm joint is rendered"
 
 
-def test_park_on_exit_is_configurable():
-    """Jogging inside a fixture must not commit you to a MoveJ home on Ctrl-C."""
-    assert JogCmdConfig().park_on_exit is True
-    assert JogCmdConfig(park_on_exit=False).park_on_exit is False
+def test_park_on_exit_is_off_by_default():
+    """A pendant leaves the arm where the operator left it.
+
+    Ending a session and reopening it should resume from the same pose, not
+    drive home and back — and a MoveJ home planned only against the robot's own
+    body is not something to trigger on a keystroke while inside a fixture.
+    """
+    assert JogCmdConfig().park_on_exit is False
+    assert JogCmdConfig(park_on_exit=True).park_on_exit is True
 
 
 def test_shutdown_uncancels_before_awaiting_cleanup():
@@ -1038,3 +1043,92 @@ async def test_park_plans_a_speed_profiled_move_not_a_jump(app, kin):
         for i in range(len(trajectory) - 1)
     ]
     assert max(steps) <= AxolConfig().max_step_rad, max(steps)
+
+
+# ---------------------------------------------------------------------------
+# Command rate
+# ---------------------------------------------------------------------------
+
+
+def test_the_robot_is_commanded_faster_than_the_ui_repaints():
+    """The setpoint stream feeds differentiators tuned for 250 Hz.
+
+    ``Axol.motion_control`` derives its velocity and acceleration feedforward
+    by differentiating the commanded positions, with a 20 Hz cutoff. Driving
+    that from the 30 Hz UI loop samples it above half-Nyquist and turns every
+    tick into a torque impulse — measured, a 0.240 rad/s velocity step against
+    0.044 rad/s at the control rate.
+    """
+    from almond_axol.cli.jog import UI_RATE_HZ
+
+    assert JogCmdConfig().rate_hz >= 8 * UI_RATE_HZ
+
+
+async def test_the_control_loop_commands_even_when_nothing_is_moving(app):
+    """A steady stream is what lets the velocity estimate settle to zero.
+
+    Commanding only on change gives the differentiator an irregular interval,
+    so its own ``Ts`` jumps around and the feedforward never converges.
+    """
+    app.cfg.rate_hz = 200.0
+    sent = 0
+    original = app.robot.motion_control
+
+    async def counting(left=None, right=None):
+        nonlocal sent
+        sent += 1
+        if sent >= 10:
+            app.quit.set()
+        await original(left=left, right=right)
+
+    app.robot.motion_control = counting
+    # No jog, no target change: the arm is stationary.
+    await asyncio.wait_for(app._control_loop(), timeout=10.0)
+    assert sent >= 10, f"only {sent} commands while stationary"
+
+
+async def test_the_control_loop_still_rate_limits(app):
+    """Splitting the loops must not lose the max_step_rad guarantee."""
+    from almond_axol.robot.config import AxolConfig
+
+    app.cfg.rate_hz = 200.0
+    app.ui["step_mm"].value = 100.0
+    for _ in range(4):
+        app._on_jog_translate(1)(event("-"))
+    for fn in app.pending.drain():
+        fn()
+    app._target_dirty = False
+    app._solve_targets()
+
+    limit = AxolConfig().max_step_rad
+    previous = app._commanded.copy()
+    steps = 0
+    while app._advance_commanded(1.0 / app.cfg.rate_hz):
+        assert np.max(np.abs(app._commanded - previous)) <= limit
+        previous = app._commanded.copy()
+        steps += 1
+        assert steps < 20000
+    assert steps > 10
+
+
+def test_tracking_reports_commanded_versus_actual(app):
+    """The readout must show a real deviation, not the commanded pose twice."""
+    app._track_last = 0.0
+    q_actual = app._commanded.copy()
+    q_actual[app.kin.indices(Arm.LEFT)[1]] += np.radians(3.0)
+
+    app._report_tracking(q_actual)
+
+    assert "3.0" in app.ui["track_worst"].value or "2.9" in app.ui["track_worst"].value
+    assert "mm" in app.ui["track_left"].value
+    assert float(app.ui["track_left"].value.split("mm")[0].strip()) > 0.0
+    # The untouched arm should read essentially zero.
+    assert float(app.ui["track_right"].value.split("mm")[0].strip()) < 0.01
+    assert "shoulder" in app.ui["track_table"].content
+
+
+def test_tracking_reads_zero_when_the_arm_is_on_target(app):
+    app._track_last = 0.0
+    app._report_tracking(app._commanded.copy())
+    assert float(app.ui["track_left"].value.split("mm")[0].strip()) < 1e-3
+    assert float(app.ui["track_right"].value.split("mm")[0].strip()) < 1e-3

@@ -45,7 +45,7 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import visual_urdf_path
+from ..constants import ARM_JOINTS, visual_urdf_path
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.path import PathPlanningError
 from ..motion import (
@@ -77,12 +77,19 @@ DEFAULT_PORT = 8010
 well want a teleop preview and this pendant open at the same time."""
 
 UI_RATE_HZ = 30.0
-"""How often the app solves IK and repaints. IK costs about 2 ms, so this is
-far from the limiting factor; it is chosen to feel immediate while dragging."""
+"""How often the app solves IK and repaints.
+
+Deliberately *not* the rate the robot is commanded at — see
+:meth:`JogApp._control_loop`. IK costs about 2 ms, so this is far from the
+limiting factor; it is chosen to feel immediate while dragging."""
 
 DRAG_IDLE_TICKS = 45
 """App-loop ticks (1.5 s at 30 Hz) a drag may go without a gizmo update before
 its flag is treated as stranded. See :meth:`JogApp._expire_stale_drags`."""
+
+TRACKING_REPORT_HZ = 8.0
+"""How often the commanded-vs-actual readout is refreshed. Fast enough to watch
+an oscillation build, slow enough not to flood the websocket."""
 
 MAX_IO_FAILURES = 30
 """Consecutive robot I/O failures tolerated before the loop gives up.
@@ -139,13 +146,17 @@ class JogCmdConfig:
     """CAN channel for the right arm."""
     rate_hz: float = 250.0
     """Control rate for planning and playback."""
-    park_on_exit: bool = True
+    park_on_exit: bool = False
     """Drive back to the rest pose when the session ends (hardware only).
 
-    Leaves the robot somewhere known. Turn it off when jogging inside a fixture
-    or a machine enclosure: the return is planned clear of the robot's *own*
-    body, and nothing in this SDK models the world around it, so a MoveJ home
-    from deep inside a workspace is not something to trigger on a keystroke."""
+    Off by default. A pendant should leave the arm where the operator left it,
+    so that closing and reopening a session resumes from the same pose instead
+    of driving home and back. ``axol waypoints`` parks because it ends a
+    program *run*; a jog session ends mid-task.
+
+    It is also the safer default: the return is planned clear of the robot's
+    own body, and nothing in this SDK models the world around it, so a MoveJ
+    home from inside a fixture is not something to trigger on a keystroke."""
     telemetry_hz: float = 500.0
     log_level: LogLevel = "INFO"
 
@@ -215,6 +226,7 @@ class JogApp:
         self._dragging: set[Arm] = set()
         self._drag_seen: dict[Arm, int] = {}
         self._io_failures = 0
+        self._track_last = 0.0
         self._playback_task: asyncio.Task | None = None
         self._fields_written: tuple[float, ...] = ()
         self._gizmo_offset: dict[Arm, Pose] = {arm: Pose.identity() for arm in ARMS}
@@ -443,6 +455,18 @@ class JogApp:
                 self.ui[key].on_update(
                     lambda _: self.pending.push(self._apply_pose_fields)
                 )
+
+        with gui.add_folder("Tracking (commanded vs actual)"):
+            self.ui["track_worst"] = gui.add_text(
+                "Worst joint", initial_value="—", disabled=True
+            )
+            self.ui["track_left"] = gui.add_text(
+                "Left tool", initial_value="—", disabled=True
+            )
+            self.ui["track_right"] = gui.add_text(
+                "Right tool", initial_value="—", disabled=True
+            )
+            self.ui["track_table"] = gui.add_markdown("_waiting for telemetry_")
 
         with gui.add_folder("Jog"):
             self.ui["step_mm"] = gui.add_slider(
@@ -723,6 +747,60 @@ class JogApp:
         self._sync_pose_fields()
         self._push_to_robot()
         self._set_status("Returned to the ready pose.")
+
+    def _joint_label(self, index: int) -> str:
+        """Operator-facing name for a joint index, e.g. ``left shoulder_2``.
+
+        The solver names joints as the URDF does (``left_s2_0``), which is not
+        what is written on the robot or in the gain tables an operator will be
+        editing.
+        """
+        for arm in ARMS:
+            positions = self.kin.indices(arm)
+            if index in positions:
+                return f"{arm.value} {ARM_JOINTS[positions.index(index)].value}"
+        return str(index)
+
+    def _report_tracking(self, q_actual: np.ndarray) -> None:
+        """Publish how far the arm is lagging what it was told to do.
+
+        The gap between ``_commanded`` and telemetry is the impedance
+        controller's tracking error: with soft gains the arm sags under its own
+        weight and trails a moving setpoint, and both show up here. Reported in
+        joint space (where the gains live) and at the tool (where it matters).
+
+        Read-only. Nothing in the control path uses these numbers.
+        """
+        now = time.monotonic()
+        if now - self._track_last < 1.0 / TRACKING_REPORT_HZ:
+            return
+        self._track_last = now
+
+        commanded = self._commanded
+        error = np.asarray(q_actual, dtype=np.float32) - commanded
+
+        worst = int(np.argmax(np.abs(error)))
+        self.ui[
+            "track_worst"
+        ].value = f"{self._joint_label(worst)}  {np.degrees(error[worst]):+.2f}°"
+
+        rows = ["| joint | cmd | actual | error |", "|---|---|---|---|"]
+        for arm in ARMS:
+            want = self.kin.fk_arm(commanded, arm, self.tool)
+            have = self.kin.fk_arm(q_actual, arm, self.tool)
+            delta = have.position - want.position
+            self.ui[f"track_{arm.value}"].value = (
+                f"{have.distance_to(want) * 1e3:6.2f} mm   "
+                f"{np.degrees(have.angle_to(want)):5.2f}°   "
+                f"(dx {delta[0] * 1e3:+.1f}, dy {delta[1] * 1e3:+.1f}, dz {delta[2] * 1e3:+.1f} mm)"
+            )
+            for index in self.kin.indices(arm):
+                rows.append(
+                    f"| {self._joint_label(index)} | {np.degrees(commanded[index]):+.2f}° "
+                    f"| {np.degrees(q_actual[index]):+.2f}° "
+                    f"| **{np.degrees(error[index]):+.2f}°** |"
+                )
+        self.ui["track_table"].content = "\n".join(rows)
 
     # -- IK loop ---------------------------------------------------------
 
@@ -1148,9 +1226,14 @@ class JogApp:
         self._set_status(
             f"Ready — {len(self.program)} waypoints. Drag a gripper, or jog with the buttons."
         )
+        control = asyncio.create_task(self._control_loop())
         try:
             await self._loop(dt)
         finally:
+            self.quit.set()
+            control.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await control
             # Never leave a playback task streaming: the caller's teardown runs
             # park() next, and two writers on one arm interleave at the control
             # rate with neither winning.
@@ -1160,8 +1243,56 @@ class JogApp:
                 with contextlib.suppress(Exception):
                     await task
 
+    async def _control_loop(self) -> None:
+        """Stream the commanded configuration at the robot's control rate.
+
+        Separate from the UI loop, and running far faster than it, because
+        ``Axol.motion_control`` differentiates the commanded positions to get
+        the velocity and acceleration feedforward terms it sends with every
+        impedance command. Those differentiators are tuned for a 250 Hz stream
+        with a 20 Hz cutoff; driving them from a 30 Hz UI loop samples them
+        above half-Nyquist and turns each tick into a torque impulse.
+
+        Measured at ``JOG_JOINT_SPEED``: 250 Hz steps the setpoint 2.4 mrad per
+        tick for a 0.044 rad/s velocity feedforward step, while 30 Hz steps it
+        20 mrad for 0.240 rad/s — five and a half times the kick, arriving at a
+        frequency a compliant arm resonates at. That is a jog that visibly
+        wobbles even with the gains set correctly.
+
+        It also commands *continuously* rather than only when something moved.
+        An irregular interval makes the differentiator's own ``Ts`` jump around,
+        and a steady stream is what lets the velocity estimate settle to zero
+        when the operator stops jogging.
+        """
+        dt = 1.0 / max(1.0, self.cfg.rate_hz)
+        while not self.quit.is_set():
+            loop_start = time.monotonic()
+            try:
+                if not self._playing:
+                    self._advance_commanded(dt)
+                    left, right = self.commander.arm_command(
+                        self._commanded, (self.grips[Arm.LEFT], self.grips[Arm.RIGHT])
+                    )
+                    self.commander.adopt_commanded(self._commanded)
+                    await self.robot.motion_control(left=left, right=right)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._io_failures += 1
+                _logger.exception("control loop write failed (%d)", self._io_failures)
+                self._set_status(f"Robot error: {exc}")
+                if self._io_failures >= MAX_IO_FAILURES:
+                    self._set_status("Robot unreachable — stopping.")
+                    self.quit.set()
+                    return
+            else:
+                self._io_failures = 0
+            spent = time.monotonic() - loop_start
+            if spent < dt:
+                await asyncio.sleep(dt - spent)
+
     async def _loop(self, dt: float) -> None:
-        """The 30 Hz body: drain callbacks, solve, rate-limit, command, render."""
+        """The UI body: drain callbacks, solve IK, repaint, report tracking."""
         while not self.quit.is_set():
             loop_start = time.monotonic()
 
@@ -1191,24 +1322,17 @@ class JogApp:
             # one out of this loop kills the pendant while a playback task may
             # still be streaming — two writers on one arm.
             try:
-                if not self._playing:
-                    if self._advance_commanded(dt) or self._to_send is not None:
-                        self._push_to_robot()
-                    if self._to_send is not None:
-                        left, right = self._to_send
-                        self._to_send = None
-                        await self.robot.motion_control(left=left, right=right)
-
                 # Render whatever the robot reports, so the view is the robot's
                 # state and not the app's intention — the same on hardware.
                 left, right = await self.commander.read_positions()
                 if left is not None and right is not None:
                     left = np.asarray(left, dtype=np.float32)
                     right = np.asarray(right, dtype=np.float32)
-                    q = self.q.copy()
-                    q[self.kin.indices(Arm.LEFT)] = left[:7]
-                    q[self.kin.indices(Arm.RIGHT)] = right[:7]
-                    self._render(q, (float(left[7]), float(right[7])))
+                    q_actual = self.q.copy()
+                    q_actual[self.kin.indices(Arm.LEFT)] = left[:7]
+                    q_actual[self.kin.indices(Arm.RIGHT)] = right[:7]
+                    self._render(q_actual, (float(left[7]), float(right[7])))
+                    self._report_tracking(q_actual)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
